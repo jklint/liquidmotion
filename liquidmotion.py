@@ -1,25 +1,29 @@
+import os
+import time
 import argparse
+import subprocess
 from wand.image import Image
 from wand.drawing import Drawing
 from wand.color import Color
-import os
-import time
-import subprocess
 
-def convert_gif_to_frames(gif_path, output_dir, frame_prefix='frame', size=(240, 240)):
+
+
+def convert_gif_to_frames(gif_path, output_dir, frame_prefix='frame', size='240x240'):
     """Converts a GIF into individual frames and resizes them using Wand."""
     with Image(filename=gif_path) as img:
-        img.sequence[0].transform(resize='240x240>')
+        img.sequence[0].transform(resize=f'{size}>')
         for i, frame in enumerate(img.sequence):
             with Image(frame) as frm:
-                frm.transform(resize='240x240>')
+                frm.transform(resize=f'{size}>')
                 output_path = os.path.join(output_dir, f'{frame_prefix}{i:03d}.png')
                 frm.save(filename=output_path)
+
 
 def get_liquid_temperature():
     """Executes the liquidctl command and parses the output to extract the liquid temperature."""
     try:
-        result = subprocess.run(['liquidctl', '-m', 'kraken', 'status'], capture_output=True, text=True)
+        result = subprocess.run(['liquidctl', '-m', 'kraken', 'status'],
+                                capture_output=True, text=True, check=False)
         output = result.stdout
         for line in output.split('\n'):
             if 'Liquid temperature' in line:
@@ -28,6 +32,7 @@ def get_liquid_temperature():
     except Exception as e:
         print(f"An error occurred while getting the liquid temperature: {e}")
         return None
+
 
 def create_temperature_image(temp, output_path, image_size=(240, 240), font_size=100):
     """Creates an image with the specified temperature."""
@@ -42,7 +47,9 @@ def create_temperature_image(temp, output_path, image_size=(240, 240), font_size
             draw(img)
             img.save(filename=output_path)
 
+
 def select_gif_for_temperature(current_temp, threshold_gifs, default_gif):
+    """Selects the correct image for the current temperature."""
     selected_gif = default_gif
     for threshold, gif in sorted(threshold_gifs, key=lambda x: float(x[0]), reverse=True):
         if current_temp >= float(threshold):
@@ -54,7 +61,8 @@ def select_gif_for_temperature(current_temp, threshold_gifs, default_gif):
 def update_lcd(image):
     """Function to update the LCD screen with the given image."""
     command = ['liquidctl', '-m', 'kraken', 'set', 'lcd', 'screen', 'static', image]
-    subprocess.run(command)
+    subprocess.run(command, check=False)
+
 
 def cleanup_files(output_dir):
     """Deletes the generated image files from the output directory."""
@@ -62,6 +70,7 @@ def cleanup_files(output_dir):
         file_path = os.path.join(output_dir, file)
         if os.path.isfile(file_path):
             os.remove(file_path)
+
 
 def main(default_gif, threshold_gif, output_dir, temp_wait):
     # Ensure the output directory exists
@@ -80,26 +89,27 @@ def main(default_gif, threshold_gif, output_dir, temp_wait):
             update_lcd(full_path)
         liquid_temp = get_liquid_temperature()
         if liquid_temp is not None:
-           create_temperature_image(liquid_temp, os.path.join(output_dir, 'temperature.png'))
-           update_lcd( os.path.join(output_dir, 'temperature.png') )
-           time.sleep(temp_wait)
+            create_temperature_image(liquid_temp, os.path.join(output_dir, 'temperature.png'))
+            update_lcd(os.path.join(output_dir, 'temperature.png'))
+            time.sleep(temp_wait)
 
-           selected_gif = select_gif_for_temperature(liquid_temp, threshold_gif, default_gif)
-           if selected_gif != last_gif:
-               cleanup_files(output_dir)
-               convert_gif_to_frames(selected_gif, output_dir)
-               images = sorted(os.listdir(output_dir))
-               last_gif = selected_gif
-
+            selected_gif = select_gif_for_temperature(liquid_temp, threshold_gif, default_gif)
+            if selected_gif != last_gif:
+                cleanup_files(output_dir)
+                convert_gif_to_frames(selected_gif, output_dir)
+                images = sorted(os.listdir(output_dir))
+                last_gif = selected_gif
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Animate GIF on LCD screen.')
     parser.add_argument('default_gif', type=str, help='Path to the default GIF file')
     parser.add_argument('--threshold_gif', action='append', nargs=2, metavar=('TEMP_THRESHOLD', 'GIF_PATH'),
-                    help='Temperature threshold and corresponding GIF path. Can be used multiple times for different thresholds.')
-    parser.add_argument('output_dir', type=str, nargs='?', default='/tmp/liquidmotion', help='Directory to store the extracted frames')
-    parser.add_argument('--temp_wait', type=int, default='5', help='How long to display temp reading in-between loops')
+                        help='Temperature threshold and corresponding GIF path. Can be used multiple times.')
+    parser.add_argument('output_dir', type=str, nargs='?', default='/tmp/liquidmotion',
+                        help='Directory to store the extracted frames')
+    parser.add_argument('--temp_wait', type=int, default='5',
+                        help='How long to display temp reading in-between loops')
     args = parser.parse_args()
 
     try:
@@ -110,4 +120,3 @@ if __name__ == '__main__':
         print("Cleanup complete. Script terminated.")
     except Exception as e:
         print(f"An error occurred: {e}")
-
