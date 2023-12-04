@@ -1,3 +1,5 @@
+#!/bin/env python
+
 import os
 import time
 import argparse
@@ -8,8 +10,13 @@ from wand.color import Color
 
 
 
+
 def convert_gif_to_frames(gif_path, output_dir, frame_prefix='frame', size='240x240'):
     """Converts a GIF into individual frames and resizes them using Wand."""
+    if not os.path.exists(gif_path):
+        create_error_image(gif_path, output_dir)
+        return
+
     with Image(filename=gif_path) as img:
         img.sequence[0].transform(resize=f'{size}>')
         for i, frame in enumerate(img.sequence):
@@ -17,6 +24,27 @@ def convert_gif_to_frames(gif_path, output_dir, frame_prefix='frame', size='240x
                 frm.transform(resize=f'{size}>')
                 output_path = os.path.join(output_dir, f'{frame_prefix}{i:03d}.png')
                 frm.save(filename=output_path)
+
+
+def create_error_image(filename, output_dir, image_size=(240, 240),
+                       large_font_size=100, small_font_size=50):
+    """Creates an image with '404' and a filename."""
+    with Image(width=image_size[0], height=image_size[1], background=Color('black')) as img:
+        with Drawing() as draw:
+            # Draw '404' in large font size
+            draw.font_size = large_font_size
+            draw.fill_color = Color('white')
+            draw.gravity = 'north'  # Align to the top
+            draw.text(0, 20, '404')  # Slightly offset from the top
+
+            # Draw filename in smaller font size
+            draw.font_size = small_font_size
+            draw.gravity = 'south'  # Align to the bottom
+            draw.text(0, 20, filename)  # Slightly offset from the bottom
+
+            draw(img)
+            output_path = os.path.join(output_dir, f'{filename}-404.png')
+            img.save(filename=output_path)
 
 
 def get_liquid_temperature():
@@ -73,6 +101,7 @@ def cleanup_files(output_dir):
 
 
 def main(default_gif, threshold_gif, output_dir, temp_wait):
+    """Prepare images and start main loop"""
     # Ensure the output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
@@ -87,6 +116,9 @@ def main(default_gif, threshold_gif, output_dir, temp_wait):
         for image in images:
             full_path = os.path.join(output_dir, image)
             update_lcd(full_path)
+            if image[-8:] == '-404.png':
+                time.sleep(temp_wait * 2)
+
         liquid_temp = get_liquid_temperature()
         if liquid_temp is not None:
             create_temperature_image(liquid_temp, os.path.join(output_dir, 'temperature.png'))
