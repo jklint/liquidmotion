@@ -10,6 +10,7 @@ import logging
 import signal
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,9 +22,15 @@ from liquidctl import find_liquidctl_devices
 LOG = logging.getLogger("liquidmotiond")
 
 LCD_SIZE = (240, 240)
-DEFAULT_MIN_FRAME_MS = 33
-DEFAULT_TEMP_POLL_INTERVAL = 2.0
-DEFAULT_STATUS_CARD_SECONDS = 2.0
+DEFAULT_ORIENTATION = 180
+DEFAULT_MIN_FRAME_MS = 110
+DEFAULT_TEMP_POLL_INTERVAL = 30.0
+DEFAULT_STATUS_CARD_SECONDS = 10.0
+DEFAULT_TEMP_FONT_SIZE = 100
+DEFAULT_TEMP_LABEL_FONT_SIZE = 48
+DEFAULT_ALWAYS_DOUBLE_SEND = True
+DEFAULT_POST_SEND_SETTLE_MS = 20.0
+DEFAULT_REINIT_ON_ERROR = True
 
 
 @dataclass(frozen=True)
@@ -42,6 +49,13 @@ class PreparedFrame:
 class PreparedAnimation:
     source: Path
     frames: List[PreparedFrame]
+
+
+@dataclass
+class TempOverlayState:
+    rgb565: Optional[bytes] = None
+    active_until: float = 0.0
+    temp_c: Optional[float] = None
 
 
 class StopRequested(Exception):
@@ -74,6 +88,9 @@ class KrakenFw2Session:
         self.dev = None
         self.connected = False
         self._double_send_next_frame = True
+        self._always_double_send = False
+        self._post_send_settle_s = 0.0
+        self._device_lock = threading.RLock()
         self._temp_key_candidates = ("Liquid temperature", "liquid temperature")
 
     def connect(self) -> None:
@@ -91,7 +108,8 @@ class KrakenFw2Session:
         self.dev.connect()
         self.connected = True
 
-        init_status = self.dev.initialize()
+        with self._device_lock:
+            init_status = self.dev.initialize()
         if init_status:
             for key, value, unit in init_status:
                 LOG.debug("init: %s=%s %s", key, value, unit)
@@ -106,7 +124,8 @@ class KrakenFw2Session:
         if not self.connected or self.dev is None:
             return
         try:
-            self.dev.disconnect()
+            with self._device_lock:
+                self.dev.disconnect()
         except Exception as exc:
             LOG.warning("Device disconnect failed: %s", exc)
         finally:
@@ -123,13 +142,15 @@ class KrakenFw2Session:
 
         for attempt in (1, 2):
             try:
-                self.dev.set_screen("lcd", "liquid", None)
+                with self._device_lock:
+                    self.dev.set_screen("lcd", "liquid", None)
                 LOG.info("LCD reset to 'liquid' mode (attempt %d)", attempt)
                 time.sleep(settle_delay)
                 return
             except TypeError:
                 try:
-                    self.dev.set_screen("lcd", "liquid")
+                    with self._device_lock:
+                        self.dev.set_screen("lcd", "liquid")
                     LOG.info("LCD reset to 'liquid' mode (attempt %d)", attempt)
                     time.sleep(settle_delay)
                     return
@@ -148,11 +169,12 @@ class KrakenFw2Session:
 
         try:
             LOG.warning("Trying reinitialize before final LCD reset...")
-            self.dev.initialize()
-            try:
-                self.dev.set_screen("lcd", "liquid", None)
-            except TypeError:
-                self.dev.set_screen("lcd", "liquid")
+            with self._device_lock:
+                self.dev.initialize()
+                try:
+                    self.dev.set_screen("lcd", "liquid", None)
+                except TypeError:
+                    self.dev.set_screen("lcd", "liquid")
             time.sleep(settle_delay)
             LOG.info("LCD reset to 'liquid' mode after reinitialize")
         except Exception as exc:
@@ -163,20 +185,55 @@ class KrakenFw2Session:
     def set_brightness(self, brightness: int) -> None:
         if self.dev is None:
             return
-        self.dev.set_screen("lcd", "brightness", int(brightness))
+        with self._device_lock:
+            self.dev.set_screen("lcd", "brightness", int(brightness))
 
     def set_orientation(self, degrees: int) -> None:
         if self.dev is None:
             return
         if degrees not in (0, 90, 180, 270):
             raise ValueError("Orientation must be one of: 0, 90, 180, 270")
-        self.dev.set_screen("lcd", "orientation", int(degrees))
+        with self._device_lock:
+            self.dev.set_screen("lcd", "orientation", int(degrees))
+
+    def configure_send_policy(self, always_double_send: bool, post_send_settle_s: float) -> None:
+        self._always_double_send = always_double_send
+        self._post_send_settle_s = max(0.0, post_send_settle_s)
+
+    def supports_public_lcd_upload(self) -> bool:
+        return self.dev is not None and hasattr(self.dev, "set_screen")
+
+    def upload_lcd_asset(self, asset_path: Path, preferred_mode: str = "auto") -> bool:
+        if self.dev is None or not self.supports_public_lcd_upload():
+            return False
+
+        candidates = [preferred_mode] if preferred_mode != "auto" else ["gif", "static"]
+        for mode in candidates:
+            try:
+                with self._device_lock:
+                    self.dev.set_screen("lcd", mode, str(asset_path))
+                LOG.info("Primed LCD stream mode with public set_screen(%s)", mode)
+                self._double_send_next_frame = True
+                return True
+            except TypeError:
+                try:
+                    with self._device_lock:
+                        self.dev.set_screen("lcd", mode, asset_path)
+                    LOG.info("Primed LCD stream mode with public set_screen(%s)", mode)
+                    self._double_send_next_frame = True
+                    return True
+                except Exception as exc:
+                    LOG.debug("Public LCD upload mode %s failed: %s", mode, exc)
+            except Exception as exc:
+                LOG.debug("Public LCD upload mode %s failed: %s", mode, exc)
+        return False
 
     def get_liquid_temp_c(self) -> Optional[float]:
         if self.dev is None:
             return None
         try:
-            status = self.dev.get_status()
+            with self._device_lock:
+                status = self.dev.get_status()
         except Exception as exc:
             LOG.warning("get_status failed: %s", exc)
             return None
@@ -195,17 +252,21 @@ class KrakenFw2Session:
 
         header = [0x06, 0x00, 0x00, 0x00] + list(len(frame_bytes).to_bytes(4, "little"))
 
-        sends = 2 if self._double_send_next_frame else 1
-        for _ in range(sends):
-            self.dev._send_2023_data_fw2(frame_bytes, header)
+        sends = 2 if (self._always_double_send or self._double_send_next_frame) else 1
+        with self._device_lock:
+            for _ in range(sends):
+                self.dev._send_2023_data_fw2(frame_bytes, header)
 
         self._double_send_next_frame = False
+        if self._post_send_settle_s > 0:
+            time.sleep(self._post_send_settle_s)
 
     def reinitialize(self) -> None:
         if self.dev is None:
             return
         LOG.warning("Reinitializing device...")
-        self.dev.initialize()
+        with self._device_lock:
+            self.dev.initialize()
         self._double_send_next_frame = True
 
 
@@ -375,6 +436,10 @@ def build_temp_card_rgb565(
     )
 
 
+def write_single_frame_gif(path: Path, image: Image.Image) -> None:
+    image.save(path, format="GIF", save_all=True, append_images=[], duration=100, loop=0, disposal=2)
+
+
 def parse_thresholds(items: Optional[Sequence[Sequence[str]]]) -> List[ThresholdRule]:
     rules: List[ThresholdRule] = []
     if not items:
@@ -445,9 +510,9 @@ def main() -> int:
     parser.add_argument(
         "--orientation",
         type=int,
-        default=0,
+        default=DEFAULT_ORIENTATION,
         choices=(0, 90, 180, 270),
-        help="LCD orientation in degrees (default: 0)",
+        help=f"LCD orientation in degrees (default: {DEFAULT_ORIENTATION})",
     )
     parser.add_argument(
         "--brightness",
@@ -465,25 +530,25 @@ def main() -> int:
         "--temp-poll-interval",
         type=float,
         default=DEFAULT_TEMP_POLL_INTERVAL,
-        help="Seconds between liquid temperature polls (default: 2.0)",
+        help=f"Seconds between liquid temperature polls (default: {DEFAULT_TEMP_POLL_INTERVAL:.0f})",
     )
     parser.add_argument(
         "--show-temp-card-seconds",
         type=float,
         default=DEFAULT_STATUS_CARD_SECONDS,
-        help="Show a temp card this many seconds when polling temp (default: 2.0, set 0 to disable)",
+        help=f"Show a temp card this many seconds when polling temp (default: {DEFAULT_STATUS_CARD_SECONDS:.0f}, set 0 to disable)",
     )
     parser.add_argument(
         "--temp-font-size",
         type=int,
-        default=72,
-        help="Temperature value font size in points (default: 72)",
+        default=DEFAULT_TEMP_FONT_SIZE,
+        help=f"Temperature value font size in points (default: {DEFAULT_TEMP_FONT_SIZE})",
     )
     parser.add_argument(
         "--temp-label-font-size",
         type=int,
-        default=24,
-        help="Temperature label font size in points (default: 24)",
+        default=DEFAULT_TEMP_LABEL_FONT_SIZE,
+        help=f"Temperature label font size in points (default: {DEFAULT_TEMP_LABEL_FONT_SIZE})",
     )
     parser.add_argument(
         "--font-path",
@@ -495,7 +560,7 @@ def main() -> int:
         "--min-frame-ms",
         type=int,
         default=DEFAULT_MIN_FRAME_MS,
-        help="Minimum per-frame duration in milliseconds (FPS safety cap; default: 33)",
+        help=f"Minimum per-frame duration in milliseconds (FPS safety cap; default: {DEFAULT_MIN_FRAME_MS})",
     )
     parser.add_argument(
         "--no-dedupe",
@@ -504,8 +569,44 @@ def main() -> int:
     )
     parser.add_argument(
         "--reinit-on-error",
+        dest="reinit_on_error",
         action="store_true",
         help="Attempt liquidctl initialize() on transfer/status errors",
+    )
+    parser.add_argument(
+        "--no-reinit-on-error",
+        dest="reinit_on_error",
+        action="store_false",
+        help="Disable automatic liquidctl initialize() recovery on transfer/status errors",
+    )
+    parser.add_argument(
+        "--reinit-every-frame",
+        action="store_true",
+        help="Force liquidctl initialize() before every animation frame (slow, but most reliable)",
+    )
+    parser.add_argument(
+        "--always-double-send",
+        dest="always_double_send",
+        action="store_true",
+        help="Send every raw LCD frame twice instead of only after init/recovery",
+    )
+    parser.add_argument(
+        "--single-send",
+        dest="always_double_send",
+        action="store_false",
+        help="Send raw LCD frames once except after init/recovery",
+    )
+    parser.add_argument(
+        "--post-send-settle-ms",
+        type=float,
+        default=DEFAULT_POST_SEND_SETTLE_MS,
+        help=f"Optional delay after each raw frame upload in milliseconds (default: {DEFAULT_POST_SEND_SETTLE_MS:.0f})",
+    )
+    parser.add_argument(
+        "--display-prime-mode",
+        choices=("auto", "gif", "static", "none"),
+        default="auto",
+        help="Try one public liquidctl image upload to arm LCD image mode before raw streaming (default: auto)",
     )
     parser.add_argument(
         "--tempdir-prefix",
@@ -548,6 +649,10 @@ def main() -> int:
         action="store_true",
         help="Verbose logging for this script",
     )
+    parser.set_defaults(
+        always_double_send=DEFAULT_ALWAYS_DOUBLE_SEND,
+        reinit_on_error=DEFAULT_REINIT_ON_ERROR,
+    )
     args = parser.parse_args()
 
     configure_logging(args.verbose, args.debug_timing)
@@ -582,9 +687,18 @@ def main() -> int:
 
         try:
             session.connect()
+            session.configure_send_policy(
+                always_double_send=args.always_double_send,
+                post_send_settle_s=max(0.0, args.post_send_settle_ms) / 1000.0,
+            )
             session.set_orientation(args.orientation)
             if args.brightness is not None:
                 session.set_brightness(int(args.brightness))
+
+            prime_asset = tempdir_path / "_prime.gif"
+            if args.display_prime_mode != "none":
+                write_single_frame_gif(prime_asset, Image.new("RGB", LCD_SIZE, (0, 0, 0)))
+                session.upload_lcd_asset(prime_asset, preferred_mode=args.display_prime_mode)
 
             def get_or_prepare_animation(gif_path: Path) -> PreparedAnimation:
                 cached = animation_cache.get(gif_path)
@@ -610,16 +724,30 @@ def main() -> int:
             current_animation_path = default_gif
             current_animation = get_or_prepare_animation(current_animation_path)
 
-            while not stopflag.stop:
-                now = time.monotonic()
+            overlay_state = TempOverlayState()
+            state_lock = threading.Lock()
+            font_path = args.font_path.expanduser() if args.font_path else None
 
-                if now - last_temp_poll >= args.temp_poll_interval:
+            def restore_display_state() -> None:
+                session.set_orientation(args.orientation)
+                if args.brightness is not None:
+                    session.set_brightness(int(args.brightness))
+                if args.display_prime_mode != "none":
+                    session.upload_lcd_asset(prime_asset, preferred_mode=args.display_prime_mode)
+
+            def temp_worker() -> None:
+                nonlocal current_animation_path, current_animation, frame_index, last_temp_poll
+                next_poll = time.monotonic()
+                while not stopflag.stop:
+                    now = time.monotonic()
+                    if now < next_poll:
+                        time.sleep(min(next_poll - now, 0.25))
+                        continue
                     temp: Optional[float] = None
                     try:
                         poll_start = time.monotonic()
                         temp = session.get_liquid_temp_c()
                         poll_ms = _ms_since(poll_start)
-
                         _log_timing(
                             args.debug_timing,
                             "temp_poll",
@@ -627,117 +755,104 @@ def main() -> int:
                             args.debug_timing_warn_ms,
                             extra=f"temp={temp!r}",
                         )
-
                         if temp is not None:
                             desired_path = select_animation_path(
                                 temp_c=temp,
                                 default_gif=default_gif,
                                 threshold_rules=threshold_rules,
                             )
-                            if desired_path != current_animation_path:
-                                LOG.info(
-                                    "Switching animation due to temp %.1fC: %s -> %s",
-                                    temp,
-                                    current_animation_path.name if current_animation_path else "?",
-                                    desired_path.name,
-                                )
-                                current_animation_path = desired_path
-                                current_animation = get_or_prepare_animation(desired_path)
-                                frame_index = 0
-                    except StopRequested:
-                        raise
+                            with state_lock:
+                                overlay_state.temp_c = temp
+                                if desired_path != current_animation_path:
+                                    LOG.info(
+                                        "Switching animation due to temp %.1fC: %s -> %s",
+                                        temp,
+                                        current_animation_path.name if current_animation_path else "?",
+                                        desired_path.name,
+                                    )
+                                    current_animation_path = desired_path
+                                    current_animation = get_or_prepare_animation(desired_path)
+                                    frame_index = 0
+                                if args.show_temp_card_seconds > 0:
+                                    overlay_state.rgb565 = build_temp_card_rgb565(
+                                        temp_c=temp,
+                                        orientation_degrees=args.orientation,
+                                        value_font_size=args.temp_font_size,
+                                        label_font_size=args.temp_label_font_size,
+                                        font_path=font_path,
+                                    )
+                                    overlay_state.active_until = time.monotonic() + args.show_temp_card_seconds
                     except Exception as exc:
                         LOG.warning("Temperature handling failed: %s", exc)
                         if args.reinit_on_error:
                             try:
                                 session.reinitialize()
-                                session.set_orientation(args.orientation)
-                                if args.brightness is not None:
-                                    session.set_brightness(int(args.brightness))
+                                restore_display_state()
                             except Exception as rexc:
                                 LOG.warning("Reinit after temp error failed: %s", rexc)
-
-                    if temp is not None and args.show_temp_card_seconds > 0:
-                        try:
-                            temp_frame = build_temp_card_rgb565(
-                                temp_c=temp,
-                                orientation_degrees=args.orientation,
-                                value_font_size=args.temp_font_size,
-                                label_font_size=args.temp_label_font_size,
-                                font_path=args.font_path.expanduser() if args.font_path else None,
-                            )
-
-                            temp_send_start = time.monotonic()
-                            session.send_rgb565_frame(temp_frame)
-                            temp_send_ms = _ms_since(temp_send_start)
-
-                            _log_timing(
-                                args.debug_timing,
-                                "temp_card_send",
-                                temp_send_ms,
-                                args.debug_timing_warn_ms,
-                            )
-
-                            sleep_until(time.monotonic() + args.show_temp_card_seconds, stopflag)
-                        except StopRequested:
-                            raise
-                        except Exception as exc:
-                            LOG.warning("Temp card handling failed: %s", exc)
-                            if args.reinit_on_error:
-                                try:
-                                    session.reinitialize()
-                                    session.set_orientation(args.orientation)
-                                    if args.brightness is not None:
-                                        session.set_brightness(int(args.brightness))
-                                except Exception as rexc:
-                                    LOG.warning("Reinit after temp card error failed: %s", rexc)
-
                     last_temp_poll = time.monotonic()
+                    next_poll = last_temp_poll + args.temp_poll_interval
 
-                if current_animation is None or not current_animation.frames:
+            temp_thread = threading.Thread(target=temp_worker, name="temp-worker", daemon=True)
+            temp_thread.start()
+
+            while not stopflag.stop:
+                now = time.monotonic()
+
+                with state_lock:
+                    animation_snapshot = current_animation
+                    overlay_active = overlay_state.rgb565 is not None and overlay_state.active_until > now
+                    overlay_rgb565 = overlay_state.rgb565 if overlay_active else None
+
+                if animation_snapshot is None or not animation_snapshot.frames:
                     raise RuntimeError("No prepared animation frames available")
 
-                frame = current_animation.frames[frame_index]
+                frame = animation_snapshot.frames[frame_index]
                 frame_counter += 1
+                frame_label = "temp_card" if overlay_rgb565 is not None else "frame_send"
+                payload = overlay_rgb565 if overlay_rgb565 is not None else frame.rgb565
+                duration_s = frame.duration_s if overlay_rgb565 is None else min(frame.duration_s, max(0.01, overlay_state.active_until - now))
 
                 loop_start = time.monotonic()
                 send_start = time.monotonic()
 
                 try:
-                    frame_start = time.monotonic()
-                    session.send_rgb565_frame(frame.rgb565)
+                    if args.reinit_every_frame and overlay_rgb565 is None:
+                        session.reinitialize()
+                        restore_display_state()
+                    session.send_rgb565_frame(payload)
                 except Exception as exc:
                     LOG.warning("Frame transfer failed: %s", exc)
                     if args.reinit_on_error:
                         try:
                             session.reinitialize()
-                            session.set_orientation(args.orientation)
-                            if args.brightness is not None:
-                                session.set_brightness(int(args.brightness))
+                            restore_display_state()
                         except Exception as rexc:
                             LOG.warning("Reinit after frame error failed: %s", rexc)
                     else:
                         sleep_until(time.monotonic() + 0.5, stopflag)
 
-                send_ms = _ms_since(send_start)
+                send_done = time.monotonic()
+                send_ms = (send_done - send_start) * 1000.0
 
                 if args.debug_timing and (
                     frame_counter % max(1, args.debug_frame_log_every) == 0
                 ):
                     _log_timing(
                         True,
-                        "frame_send",
+                        frame_label,
                         send_ms,
                         args.debug_timing_warn_ms,
                         extra=(
                             f"frame={frame_counter} idx={frame_index} "
-                            f"duration={frame.duration_s * 1000.0:.1f}ms "
-                            f"bytes={len(frame.rgb565)}"
+                            f"duration={duration_s * 1000.0:.1f}ms "
+                            f"bytes={len(payload)}"
                         ),
                     )
 
-                deadline = frame_start + frame.duration_s
-                frame_index = (frame_index + 1) % len(current_animation.frames)
+                deadline = send_done + duration_s
+                if overlay_rgb565 is None:
+                    frame_index = (frame_index + 1) % len(animation_snapshot.frames)
                 sleep_until(deadline, stopflag)
 
                 loop_ms = _ms_since(loop_start)
@@ -762,6 +877,8 @@ def main() -> int:
         finally:
             stopflag.request()
             try:
+                if "temp_thread" in locals():
+                    temp_thread.join(timeout=1.0)
                 if args.reset_mode_on_exit == "liquid":
                     session.reset_display(settle_delay=args.reset_settle_delay)
             finally:
