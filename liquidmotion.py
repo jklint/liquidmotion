@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
 """
 liquidmotiond.py - Kraken 2023 fw2 GIF emulation daemon using liquidctl Python API
-
-Features:
-- Persistent liquidctl connection (no subprocess per frame)
-- Precomputed in-memory frames (RGB565) for low CPU usage
-- GIF frame-duration pacing (sleep-driven, no busy loop)
-- Optional temperature-based animation selection
-- Optional periodic temperature card display
-- Daemon/systemd friendly (SIGTERM/SIGINT handling)
-- Resets LCD to default 'liquid' mode on exit
-- Uses OS temp directory for any temp artifacts and cleans them on exit
-
-Target:
-- NZXT Kraken 2023 / Kraken 2023 Elite on firmware 2.x with liquidctl 1.15.x
 """
 
 from __future__ import annotations
@@ -34,7 +21,7 @@ from liquidctl import find_liquidctl_devices
 LOG = logging.getLogger("liquidmotiond")
 
 LCD_SIZE = (240, 240)
-DEFAULT_MIN_FRAME_MS = 33  # ~30 fps cap safety
+DEFAULT_MIN_FRAME_MS = 33
 DEFAULT_TEMP_POLL_INTERVAL = 2.0
 DEFAULT_STATUS_CARD_SECONDS = 2.0
 
@@ -80,10 +67,6 @@ class ShutdownFlag:
 class KrakenFw2Session:
     """
     Persistent liquidctl session for Kraken 2023 fw2.x using private driver methods.
-
-    Notes:
-    - Pins to liquidctl internals present in 1.15.x (private API, may break on upgrade).
-    - Uses the firmware-2 static transfer path for each emulated GIF frame.
     """
 
     def __init__(self, match: str = "kraken") -> None:
@@ -99,7 +82,6 @@ class KrakenFw2Session:
         if not candidates:
             raise RuntimeError(f"No liquidctl device found matching '{self.match}'")
 
-        # Prefer Kraken 2023-ish descriptions if multiple Kraken devices exist.
         candidates.sort(
             key=lambda d: ("2023" not in d.description, "Elite" not in d.description, d.description)
         )
@@ -114,7 +96,6 @@ class KrakenFw2Session:
             for key, value, unit in init_status:
                 LOG.debug("init: %s=%s %s", key, value, unit)
 
-        # Validate private fw2 method exists (liquidctl 1.15.x)
         if not hasattr(self.dev, "_send_2023_data_fw2"):
             raise RuntimeError(
                 "liquidctl driver missing expected private method '_send_2023_data_fw2'. "
@@ -134,39 +115,50 @@ class KrakenFw2Session:
     def reset_display(self, settle_delay: float = 0.35) -> None:
         """
         Return LCD to default liquid display mode before exit.
-
-        A short delay after the command improves visible reliability on fw2 devices.
         """
         if self.dev is None:
             return
 
         last_exc: Optional[Exception] = None
 
-        # Try twice first; fw2 LCD updates can be temperamental during shutdown.
         for attempt in (1, 2):
             try:
                 self.dev.set_screen("lcd", "liquid", None)
                 LOG.info("LCD reset to 'liquid' mode (attempt %d)", attempt)
                 time.sleep(settle_delay)
                 return
+            except TypeError:
+                try:
+                    self.dev.set_screen("lcd", "liquid")
+                    LOG.info("LCD reset to 'liquid' mode (attempt %d)", attempt)
+                    time.sleep(settle_delay)
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    LOG.warning(
+                        "Failed to reset LCD to liquid mode (attempt %d): %s",
+                        attempt,
+                        exc,
+                    )
+                    time.sleep(0.15)
             except Exception as exc:
                 last_exc = exc
                 LOG.warning("Failed to reset LCD to liquid mode (attempt %d): %s", attempt, exc)
                 time.sleep(0.15)
 
-        # Recovery attempt: reinitialize once, then retry reset
         try:
             LOG.warning("Trying reinitialize before final LCD reset...")
             self.dev.initialize()
-            self.dev.set_screen("lcd", "liquid", None)
+            try:
+                self.dev.set_screen("lcd", "liquid", None)
+            except TypeError:
+                self.dev.set_screen("lcd", "liquid")
             time.sleep(settle_delay)
             LOG.info("LCD reset to 'liquid' mode after reinitialize")
-            return
         except Exception as exc:
             LOG.warning("Final LCD reset attempt failed: %s", exc)
-
-        if last_exc is not None:
-            LOG.debug("Original reset error was: %s", last_exc)
+            if last_exc is not None:
+                LOG.debug("Original reset error was: %s", last_exc)
 
     def set_brightness(self, brightness: int) -> None:
         if self.dev is None:
@@ -181,11 +173,6 @@ class KrakenFw2Session:
         self.dev.set_screen("lcd", "orientation", int(degrees))
 
     def get_liquid_temp_c(self) -> Optional[float]:
-        """
-        Read temperature through liquidctl persistent API.
-
-        This avoids invoking the CLI subprocess repeatedly.
-        """
         if self.dev is None:
             return None
         try:
@@ -203,25 +190,18 @@ class KrakenFw2Session:
         return None
 
     def send_rgb565_frame(self, frame_bytes: bytes) -> None:
-        """
-        Send one 240x240 RGB565 frame via fw2 bulk path (emulated GIF frame).
-
-        Uses the same header structure liquidctl uses for fw2 static images.
-        """
         if self.dev is None:
             raise RuntimeError("Device not connected")
 
         header = [0x06, 0x00, 0x00, 0x00] + list(len(frame_bytes).to_bytes(4, "little"))
 
-        # liquidctl often sends the first static frame twice after init; preserve that behavior.
         sends = 2 if self._double_send_next_frame else 1
         for _ in range(sends):
-            self.dev._send_2023_data_fw2(frame_bytes, header)  # private API call
+            self.dev._send_2023_data_fw2(frame_bytes, header)
 
         self._double_send_next_frame = False
 
     def reinitialize(self) -> None:
-        """Reinitialize after transient failures (USB hiccup/resume/etc.)."""
         if self.dev is None:
             return
         LOG.warning("Reinitializing device...")
@@ -230,10 +210,6 @@ class KrakenFw2Session:
 
 
 def _rgb565_from_pil(img: Image.Image) -> bytes:
-    """
-    Convert PIL RGB image to packed RGB565 bytes.
-    Matches liquidctl fw2 static path byte packing.
-    """
     rgb = img.convert("RGB")
     out = bytearray()
     for r, g, b in rgb.getdata():
@@ -246,9 +222,6 @@ def _rgb565_from_pil(img: Image.Image) -> bytes:
 
 
 def _compose_opaque(frame: Image.Image, background=(0, 0, 0)) -> Image.Image:
-    """
-    Ensure a fully opaque RGB image to avoid layering/ghosting artifacts with transparency.
-    """
     rgba = frame.convert("RGBA")
     base = Image.new("RGBA", rgba.size, background + (255,))
     composed = Image.alpha_composite(base, rgba)
@@ -258,14 +231,10 @@ def _compose_opaque(frame: Image.Image, background=(0, 0, 0)) -> Image.Image:
 def _rotate_for_orientation(img: Image.Image, orientation_degrees: int) -> Image.Image:
     if orientation_degrees not in (0, 90, 180, 270):
         raise ValueError("Invalid orientation")
-    # Match liquidctl rotation convention
     return img.rotate(-orientation_degrees, expand=False)
 
 
 def _load_font(font_path: Optional[Path], size: int):
-    """
-    Load a scalable TTF font when possible, otherwise fall back to PIL default font.
-    """
     if font_path is not None:
         try:
             return ImageFont.truetype(str(font_path), size=size)
@@ -288,15 +257,36 @@ def _load_font(font_path: Optional[Path], size: int):
     return ImageFont.load_default()
 
 
+def _ms_since(start: float) -> float:
+    return (time.monotonic() - start) * 1000.0
+
+
+def _log_timing(
+    enabled: bool,
+    label: str,
+    elapsed_ms: float,
+    warn_ms: float,
+    extra: str = "",
+) -> None:
+    if not enabled:
+        return
+
+    msg = f"{label}: {elapsed_ms:.1f} ms"
+    if extra:
+        msg += f" | {extra}"
+
+    if elapsed_ms >= warn_ms:
+        LOG.warning(msg)
+    else:
+        LOG.debug(msg)
+
+
 def prepare_gif_animation(
     gif_path: Path,
     orientation_degrees: int,
     min_frame_ms: int = DEFAULT_MIN_FRAME_MS,
     dedupe: bool = True,
 ) -> PreparedAnimation:
-    """
-    Decode GIF to precomputed 240x240 RGB565 frames with durations.
-    """
     img = Image.open(gif_path)
     frames: List[PreparedFrame] = []
     prev_bytes: Optional[bytes] = None
@@ -330,9 +320,6 @@ def build_temp_card_image(
     label_font_size: int = 24,
     font_path: Optional[Path] = None,
 ) -> Image.Image:
-    """
-    Render a temperature card in memory with scalable text.
-    """
     canvas = Image.new("RGB", LCD_SIZE, (0, 0, 0))
     draw = ImageDraw.Draw(canvas)
 
@@ -352,10 +339,7 @@ def build_temp_card_image(
 
     gap = max(8, label_font_size // 2)
     total_h = label_h + gap + value_h
-    y0 = (LCD_SIZE[1] - total_h) // 2
-
-    # Slight upward bias looks visually more centered on round display
-    y0 -= 8
+    y0 = (LCD_SIZE[1] - total_h) // 2 - 8
 
     draw.text(
         ((LCD_SIZE[0] - label_w) // 2, y0),
@@ -370,8 +354,7 @@ def build_temp_card_image(
         font=font_value,
     )
 
-    canvas = _rotate_for_orientation(canvas, orientation_degrees)
-    return canvas
+    return _rotate_for_orientation(canvas, orientation_degrees)
 
 
 def build_temp_card_rgb565(
@@ -398,7 +381,7 @@ def parse_thresholds(items: Optional[Sequence[Sequence[str]]]) -> List[Threshold
         return rules
     for threshold, path in items:
         rules.append(ThresholdRule(threshold_c=float(threshold), gif_path=Path(path).expanduser()))
-    rules.sort(key=lambda r: r.threshold_c, reverse=True)  # highest first
+    rules.sort(key=lambda r: r.threshold_c, reverse=True)
     return rules
 
 
@@ -426,13 +409,27 @@ def sleep_until(deadline: float, stopflag: ShutdownFlag) -> None:
         time.sleep(min(remaining, 0.25))
 
 
-def configure_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
+def configure_logging(verbose: bool, debug_timing: bool) -> None:
+    level = logging.DEBUG if (verbose or debug_timing) else logging.INFO
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
+
+    # Keep third-party chatter from crushing the terminal buffer.
+    noisy_loggers = [
+        "liquidctl",
+        "liquidctl.driver",
+        "usb",
+        "usb.core",
+        "usb.backend",
+        "hid",
+        "PIL",
+    ]
+    for name in noisy_loggers:
+        if name != "liquidmotiond":
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def main() -> int:
@@ -530,13 +527,30 @@ def main() -> int:
         help="Seconds to wait after exit LCD reset command (default: 0.35)",
     )
     parser.add_argument(
+        "--debug-timing",
+        action="store_true",
+        help="Log timing for frame sends and temp polls without enabling raw third-party debug spam",
+    )
+    parser.add_argument(
+        "--debug-timing-warn-ms",
+        type=float,
+        default=250.0,
+        help="Warn when frame send or temp poll exceeds this many ms (default: 250)",
+    )
+    parser.add_argument(
+        "--debug-frame-log-every",
+        type=int,
+        default=10,
+        help="When --debug-timing is enabled, log every Nth frame (default: 10)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Verbose logging",
+        help="Verbose logging for this script",
     )
     args = parser.parse_args()
 
-    configure_logging(args.verbose)
+    configure_logging(args.verbose, args.debug_timing)
 
     default_gif = args.default_gif.expanduser()
     if not default_gif.is_file():
@@ -553,8 +567,6 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stopflag.request_stop)
     signal.signal(signal.SIGINT, stopflag.request_stop)
 
-    # Temp dir in system default location; auto-cleaned on exit.
-    # Script is primarily in-memory, but this satisfies daemon/tempdir requirements.
     with tempfile.TemporaryDirectory(prefix=args.tempdir_prefix) as tempdir:
         tempdir_path = Path(tempdir)
         LOG.debug("Using temp dir: %s", tempdir_path)
@@ -566,11 +578,10 @@ def main() -> int:
 
         last_temp_poll = 0.0
         frame_index = 0
+        frame_counter = 0
 
         try:
             session.connect()
-
-            # Apply LCD settings after connect/initialize.
             session.set_orientation(args.orientation)
             if args.brightness is not None:
                 session.set_brightness(int(args.brightness))
@@ -596,20 +607,28 @@ def main() -> int:
                 )
                 return prepared
 
-            # Prime initial animation
             current_animation_path = default_gif
             current_animation = get_or_prepare_animation(current_animation_path)
 
             while not stopflag.stop:
                 now = time.monotonic()
 
-                # Poll temperature on interval
                 if now - last_temp_poll >= args.temp_poll_interval:
+                    temp: Optional[float] = None
                     try:
+                        poll_start = time.monotonic()
                         temp = session.get_liquid_temp_c()
-                        if temp is not None:
-                            LOG.debug("Liquid temp: %.1f C", temp)
+                        poll_ms = _ms_since(poll_start)
 
+                        _log_timing(
+                            args.debug_timing,
+                            "temp_poll",
+                            poll_ms,
+                            args.debug_timing_warn_ms,
+                            extra=f"temp={temp!r}",
+                        )
+
+                        if temp is not None:
                             desired_path = select_animation_path(
                                 temp_c=temp,
                                 default_gif=default_gif,
@@ -625,19 +644,6 @@ def main() -> int:
                                 current_animation_path = desired_path
                                 current_animation = get_or_prepare_animation(desired_path)
                                 frame_index = 0
-
-                            # Optionally show a temp card briefly
-                            if args.show_temp_card_seconds > 0:
-                                temp_frame = build_temp_card_rgb565(
-                                    temp_c=temp,
-                                    orientation_degrees=args.orientation,
-                                    value_font_size=args.temp_font_size,
-                                    label_font_size=args.temp_label_font_size,
-                                    font_path=args.font_path.expanduser() if args.font_path else None,
-                                )
-                                session.send_rgb565_frame(temp_frame)
-                                sleep_until(time.monotonic() + args.show_temp_card_seconds, stopflag)
-
                     except StopRequested:
                         raise
                     except Exception as exc:
@@ -651,13 +657,54 @@ def main() -> int:
                             except Exception as rexc:
                                 LOG.warning("Reinit after temp error failed: %s", rexc)
 
+                    if temp is not None and args.show_temp_card_seconds > 0:
+                        try:
+                            temp_frame = build_temp_card_rgb565(
+                                temp_c=temp,
+                                orientation_degrees=args.orientation,
+                                value_font_size=args.temp_font_size,
+                                label_font_size=args.temp_label_font_size,
+                                font_path=args.font_path.expanduser() if args.font_path else None,
+                            )
+
+                            temp_send_start = time.monotonic()
+                            session.send_rgb565_frame(temp_frame)
+                            temp_send_ms = _ms_since(temp_send_start)
+
+                            _log_timing(
+                                args.debug_timing,
+                                "temp_card_send",
+                                temp_send_ms,
+                                args.debug_timing_warn_ms,
+                            )
+
+                            sleep_until(time.monotonic() + args.show_temp_card_seconds, stopflag)
+                        except StopRequested:
+                            raise
+                        except Exception as exc:
+                            LOG.warning("Temp card handling failed: %s", exc)
+                            if args.reinit_on_error:
+                                try:
+                                    session.reinitialize()
+                                    session.set_orientation(args.orientation)
+                                    if args.brightness is not None:
+                                        session.set_brightness(int(args.brightness))
+                                except Exception as rexc:
+                                    LOG.warning("Reinit after temp card error failed: %s", rexc)
+
                     last_temp_poll = time.monotonic()
 
                 if current_animation is None or not current_animation.frames:
                     raise RuntimeError("No prepared animation frames available")
 
                 frame = current_animation.frames[frame_index]
+                frame_counter += 1
+
+                loop_start = time.monotonic()
+                send_start = time.monotonic()
+
                 try:
+                    frame_start = time.monotonic()
                     session.send_rgb565_frame(frame.rgb565)
                 except Exception as exc:
                     LOG.warning("Frame transfer failed: %s", exc)
@@ -672,9 +719,38 @@ def main() -> int:
                     else:
                         sleep_until(time.monotonic() + 0.5, stopflag)
 
-                deadline = time.monotonic() + frame.duration_s
+                send_ms = _ms_since(send_start)
+
+                if args.debug_timing and (
+                    frame_counter % max(1, args.debug_frame_log_every) == 0
+                ):
+                    _log_timing(
+                        True,
+                        "frame_send",
+                        send_ms,
+                        args.debug_timing_warn_ms,
+                        extra=(
+                            f"frame={frame_counter} idx={frame_index} "
+                            f"duration={frame.duration_s * 1000.0:.1f}ms "
+                            f"bytes={len(frame.rgb565)}"
+                        ),
+                    )
+
+                deadline = frame_start + frame.duration_s
                 frame_index = (frame_index + 1) % len(current_animation.frames)
                 sleep_until(deadline, stopflag)
+
+                loop_ms = _ms_since(loop_start)
+                if args.debug_timing and (
+                    frame_counter % max(1, args.debug_frame_log_every) == 0
+                ):
+                    _log_timing(
+                        True,
+                        "frame_loop",
+                        loop_ms,
+                        args.debug_timing_warn_ms,
+                        extra=f"frame={frame_counter}",
+                    )
 
         except StopRequested:
             LOG.info("Stop requested")
@@ -684,7 +760,6 @@ def main() -> int:
             LOG.exception("Fatal error: %s", exc)
             return 1
         finally:
-            # Explicitly stop any further sleeps/transfers before shutdown reset
             stopflag.request()
             try:
                 if args.reset_mode_on_exit == "liquid":
