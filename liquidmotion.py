@@ -50,6 +50,14 @@ class PreparedAnimation:
     source: Path
     frames: List[PreparedFrame]
 
+    @property
+    def total_frame_bytes(self) -> int:
+        return sum(len(frame.rgb565) for frame in self.frames)
+
+    @property
+    def total_duration_s(self) -> float:
+        return sum(frame.duration_s for frame in self.frames)
+
 
 @dataclass
 class TempOverlayState:
@@ -445,7 +453,7 @@ def parse_thresholds(items: Optional[Sequence[Sequence[str]]]) -> List[Threshold
     if not items:
         return rules
     for threshold, path in items:
-        rules.append(ThresholdRule(threshold_c=float(threshold), gif_path=Path(path).expanduser()))
+        rules.append(ThresholdRule(threshold_c=float(threshold), gif_path=Path(path).expanduser().resolve()))
     rules.sort(key=lambda r: r.threshold_c, reverse=True)
     return rules
 
@@ -472,6 +480,44 @@ def sleep_until(deadline: float, stopflag: ShutdownFlag) -> None:
         if stopflag.stop:
             raise StopRequested()
         time.sleep(min(remaining, 0.25))
+
+
+def preload_animation_cache(
+    animation_paths: Sequence[Path],
+    get_or_prepare_animation,
+) -> None:
+    unique_paths: List[Path] = []
+    seen: set[Path] = set()
+    for gif_path in animation_paths:
+        resolved = gif_path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_paths.append(resolved)
+
+    if not unique_paths:
+        return
+
+    preload_start = time.monotonic()
+    total_frames = 0
+    total_bytes = 0
+    total_duration_s = 0.0
+
+    for gif_path in unique_paths:
+        prepared = get_or_prepare_animation(gif_path)
+        total_frames += len(prepared.frames)
+        total_bytes += prepared.total_frame_bytes
+        total_duration_s += prepared.total_duration_s
+
+    elapsed_ms = _ms_since(preload_start)
+    LOG.info(
+        "Preloaded %d animation(s): %d frames, %.2fs total loop data, %.2f MiB RGB565 cache (%.1f ms)",
+        len(unique_paths),
+        total_frames,
+        total_duration_s,
+        total_bytes / (1024.0 * 1024.0),
+        elapsed_ms,
+    )
 
 
 def configure_logging(verbose: bool, debug_timing: bool) -> None:
@@ -649,15 +695,28 @@ def main() -> int:
         action="store_true",
         help="Verbose logging for this script",
     )
+    parser.add_argument(
+        "--preload-animations",
+        dest="preload_animations",
+        action="store_true",
+        help="Prepare all referenced GIFs at startup for instant swaps (default)",
+    )
+    parser.add_argument(
+        "--lazy-load-animations",
+        dest="preload_animations",
+        action="store_false",
+        help="Only prepare GIFs on first use instead of startup preload",
+    )
     parser.set_defaults(
         always_double_send=DEFAULT_ALWAYS_DOUBLE_SEND,
         reinit_on_error=DEFAULT_REINIT_ON_ERROR,
+        preload_animations=True,
     )
     args = parser.parse_args()
 
     configure_logging(args.verbose, args.debug_timing)
 
-    default_gif = args.default_gif.expanduser()
+    default_gif = args.default_gif.expanduser().resolve()
     if not default_gif.is_file():
         LOG.error("Default GIF not found: %s", default_gif)
         return 2
@@ -701,6 +760,7 @@ def main() -> int:
                 session.upload_lcd_asset(prime_asset, preferred_mode=args.display_prime_mode)
 
             def get_or_prepare_animation(gif_path: Path) -> PreparedAnimation:
+                gif_path = gif_path.resolve()
                 cached = animation_cache.get(gif_path)
                 if cached is not None:
                     return cached
@@ -712,14 +772,20 @@ def main() -> int:
                     dedupe=not args.no_dedupe,
                 )
                 animation_cache[gif_path] = prepared
-                total_duration = sum(f.duration_s for f in prepared.frames)
                 LOG.info(
-                    "Prepared %s: %d frames (%.2fs loop)",
+                    "Prepared %s: %d frames (%.2fs loop, %.2f MiB cache)",
                     gif_path.name,
                     len(prepared.frames),
-                    total_duration,
+                    prepared.total_duration_s,
+                    prepared.total_frame_bytes / (1024.0 * 1024.0),
                 )
                 return prepared
+
+            if args.preload_animations:
+                preload_animation_cache(
+                    [default_gif] + [rule.gif_path for rule in threshold_rules],
+                    get_or_prepare_animation,
+                )
 
             current_animation_path = default_gif
             current_animation = get_or_prepare_animation(current_animation_path)
