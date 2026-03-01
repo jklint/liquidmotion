@@ -12,9 +12,9 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from PIL import Image, ImageDraw, ImageFont, ImageSequence
 from liquidctl import find_liquidctl_devices
@@ -32,63 +32,94 @@ DEFAULT_ALWAYS_DOUBLE_SEND = True
 DEFAULT_POST_SEND_SETTLE_MS = 20.0
 DEFAULT_REINIT_ON_ERROR = True
 
+# Common system TTF font paths tried in order when no custom font is provided.
+_COMMON_FONT_PATHS = (
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+)
+
+# Liquid-temperature key names returned by liquidctl get_status().
+_TEMP_KEY_CANDIDATES = frozenset(("Liquid temperature", "liquid temperature"))
+
+# Valid LCD orientation values accepted by the Kraken driver.
+_VALID_ORIENTATIONS = (0, 90, 180, 270)
+
 
 @dataclass(frozen=True)
 class ThresholdRule:
+    """Associates a temperature threshold with a GIF to display above it."""
+
     threshold_c: float
     gif_path: Path
 
 
 @dataclass
 class PreparedFrame:
+    """A single pre-converted animation frame ready for transmission."""
+
     rgb565: bytes
     duration_s: float
 
 
 @dataclass
 class PreparedAnimation:
+    """All pre-converted frames for one GIF animation."""
+
     source: Path
-    frames: List[PreparedFrame]
+    frames: List[PreparedFrame] = field(default_factory=list)
 
     @property
     def total_frame_bytes(self) -> int:
+        """Total byte size of all RGB565 frame payloads."""
         return sum(len(frame.rgb565) for frame in self.frames)
 
     @property
     def total_duration_s(self) -> float:
+        """Cumulative playback duration of all frames in seconds."""
         return sum(frame.duration_s for frame in self.frames)
 
 
 @dataclass
 class TempOverlayState:
+    """Mutable state shared between the main loop and the temperature worker."""
+
     rgb565: Optional[bytes] = None
     active_until: float = 0.0
     temp_c: Optional[float] = None
 
 
 class StopRequested(Exception):
-    """Raised when service stop was requested."""
+    """Raised internally when a graceful service stop has been requested."""
 
 
 class ShutdownFlag:
+    """Thread-safe flag that converts OS signals into a stop request."""
+
     def __init__(self) -> None:
         self._stop = False
 
-    def request_stop(self, signum: int, _frame) -> None:
+    def request_stop(self, signum: int, _frame: object) -> None:
+        """Signal handler: record which signal triggered the stop."""
         LOG.info("Received signal %s, stopping...", signum)
         self._stop = True
 
     def request(self) -> None:
+        """Programmatic stop request (e.g. from finally blocks)."""
         self._stop = True
 
     @property
     def stop(self) -> bool:
+        """True once a stop has been requested."""
         return self._stop
 
 
 class KrakenFw2Session:
-    """
-    Persistent liquidctl session for Kraken 2023 fw2.x using private driver methods.
+    """Persistent liquidctl session for the Kraken 2023 fw2.x LCD display.
+
+    Uses the private ``_send_2023_data_fw2`` driver method for raw frame
+    streaming.  Pin ``liquidctl==1.15.x`` to keep that private API stable.
     """
 
     def __init__(self, match: str = "kraken") -> None:
@@ -99,16 +130,24 @@ class KrakenFw2Session:
         self._always_double_send = False
         self._post_send_settle_s = 0.0
         self._device_lock = threading.RLock()
-        self._temp_key_candidates = ("Liquid temperature", "liquid temperature")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def connect(self) -> None:
+        """Discover the device, open a connection, and run initialize()."""
         devices = find_liquidctl_devices()
         candidates = [d for d in devices if self.match in d.description.lower()]
         if not candidates:
             raise RuntimeError(f"No liquidctl device found matching '{self.match}'")
 
         candidates.sort(
-            key=lambda d: ("2023" not in d.description, "Elite" not in d.description, d.description)
+            key=lambda d: (
+                "2023" not in d.description,
+                "Elite" not in d.description,
+                d.description,
+            )
         )
         self.dev = candidates[0]
         LOG.info("Using device: %s", self.dev.description)
@@ -129,20 +168,19 @@ class KrakenFw2Session:
             )
 
     def disconnect(self) -> None:
+        """Close the device connection, swallowing errors."""
         if not self.connected or self.dev is None:
             return
         try:
             with self._device_lock:
                 self.dev.disconnect()
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             LOG.warning("Device disconnect failed: %s", exc)
         finally:
             self.connected = False
 
     def reset_display(self, settle_delay: float = 0.35) -> None:
-        """
-        Return LCD to default liquid display mode before exit.
-        """
+        """Return the LCD to default liquid-temperature display mode on exit."""
         if self.dev is None:
             return
 
@@ -162,7 +200,7 @@ class KrakenFw2Session:
                     LOG.info("LCD reset to 'liquid' mode (attempt %d)", attempt)
                     time.sleep(settle_delay)
                     return
-                except Exception as exc:
+                except Exception as exc:  # pylint: disable=broad-except
                     last_exc = exc
                     LOG.warning(
                         "Failed to reset LCD to liquid mode (attempt %d): %s",
@@ -170,11 +208,14 @@ class KrakenFw2Session:
                         exc,
                     )
                     time.sleep(0.15)
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-except
                 last_exc = exc
-                LOG.warning("Failed to reset LCD to liquid mode (attempt %d): %s", attempt, exc)
+                LOG.warning(
+                    "Failed to reset LCD to liquid mode (attempt %d): %s", attempt, exc
+                )
                 time.sleep(0.15)
 
+        # Final attempt: reinitialise first, then reset.
         try:
             LOG.warning("Trying reinitialize before final LCD reset...")
             with self._device_lock:
@@ -185,33 +226,51 @@ class KrakenFw2Session:
                     self.dev.set_screen("lcd", "liquid")
             time.sleep(settle_delay)
             LOG.info("LCD reset to 'liquid' mode after reinitialize")
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             LOG.warning("Final LCD reset attempt failed: %s", exc)
             if last_exc is not None:
                 LOG.debug("Original reset error was: %s", last_exc)
 
+    # ------------------------------------------------------------------
+    # Device configuration
+    # ------------------------------------------------------------------
+
     def set_brightness(self, brightness: int) -> None:
+        """Set LCD brightness (0-100)."""
         if self.dev is None:
             return
         with self._device_lock:
             self.dev.set_screen("lcd", "brightness", int(brightness))
 
     def set_orientation(self, degrees: int) -> None:
+        """Set LCD rotation.  *degrees* must be one of 0, 90, 180, 270."""
         if self.dev is None:
             return
-        if degrees not in (0, 90, 180, 270):
+        if degrees not in _VALID_ORIENTATIONS:
             raise ValueError("Orientation must be one of: 0, 90, 180, 270")
         with self._device_lock:
             self.dev.set_screen("lcd", "orientation", int(degrees))
 
-    def configure_send_policy(self, always_double_send: bool, post_send_settle_s: float) -> None:
+    def configure_send_policy(
+        self, always_double_send: bool, post_send_settle_s: float
+    ) -> None:
+        """Configure the double-send and settle-delay policy for frame uploads."""
         self._always_double_send = always_double_send
         self._post_send_settle_s = max(0.0, post_send_settle_s)
 
+    # ------------------------------------------------------------------
+    # LCD asset and frame upload
+    # ------------------------------------------------------------------
+
     def supports_public_lcd_upload(self) -> bool:
+        """Return True if the device exposes the public set_screen() API."""
         return self.dev is not None and hasattr(self.dev, "set_screen")
 
     def upload_lcd_asset(self, asset_path: Path, preferred_mode: str = "auto") -> bool:
+        """Prime the LCD stream mode by uploading a static/GIF asset via set_screen().
+
+        Returns True on success, False if every candidate mode failed.
+        """
         if self.dev is None or not self.supports_public_lcd_upload():
             return False
 
@@ -230,24 +289,29 @@ class KrakenFw2Session:
                     LOG.info("Primed LCD stream mode with public set_screen(%s)", mode)
                     self._double_send_next_frame = True
                     return True
-                except Exception as exc:
+                except Exception as exc:  # pylint: disable=broad-except
                     LOG.debug("Public LCD upload mode %s failed: %s", mode, exc)
-            except Exception as exc:
+            except Exception as exc:  # pylint: disable=broad-except
                 LOG.debug("Public LCD upload mode %s failed: %s", mode, exc)
         return False
 
+    # ------------------------------------------------------------------
+    # Status and raw frame sending
+    # ------------------------------------------------------------------
+
     def get_liquid_temp_c(self) -> Optional[float]:
+        """Poll the device for liquid temperature; returns None on failure."""
         if self.dev is None:
             return None
         try:
             with self._device_lock:
                 status = self.dev.get_status()
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             LOG.warning("get_status failed: %s", exc)
             return None
 
         for key, value, _unit in status:
-            if str(key) in self._temp_key_candidates:
+            if str(key) in _TEMP_KEY_CANDIDATES:
                 try:
                     return float(value)
                 except (TypeError, ValueError):
@@ -255,21 +319,25 @@ class KrakenFw2Session:
         return None
 
     def send_rgb565_frame(self, frame_bytes: bytes) -> None:
+        """Transmit a raw RGB565 frame to the LCD via the private fw2 API."""
         if self.dev is None:
             raise RuntimeError("Device not connected")
 
-        header = [0x06, 0x00, 0x00, 0x00] + list(len(frame_bytes).to_bytes(4, "little"))
-
+        header = [0x06, 0x00, 0x00, 0x00] + list(
+            len(frame_bytes).to_bytes(4, "little")
+        )
         sends = 2 if (self._always_double_send or self._double_send_next_frame) else 1
+
         with self._device_lock:
             for _ in range(sends):
-                self.dev._send_2023_data_fw2(frame_bytes, header)
+                self.dev._send_2023_data_fw2(frame_bytes, header)  # pylint: disable=protected-access
 
         self._double_send_next_frame = False
         if self._post_send_settle_s > 0:
             time.sleep(self._post_send_settle_s)
 
     def reinitialize(self) -> None:
+        """Call device initialize() and force a double-send on the next frame."""
         if self.dev is None:
             return
         LOG.warning("Reinitializing device...")
@@ -278,55 +346,66 @@ class KrakenFw2Session:
         self._double_send_next_frame = True
 
 
+# ---------------------------------------------------------------------------
+# Image conversion helpers
+# ---------------------------------------------------------------------------
+
 def _rgb565_from_pil(img: Image.Image) -> bytes:
+    """Convert a PIL Image to a packed RGB565 byte string."""
     rgb = img.convert("RGB")
     out = bytearray()
     for r, g, b in rgb.getdata():
         dr = r >> 3
         dg = g >> 2
         db = b >> 3
-        out.append((dr << 3) + (dg >> 3))
-        out.append(((dg & 0x7) << 5) + db)
+        out.append((dr << 3) | (dg >> 3))
+        out.append(((dg & 0x7) << 5) | db)
     return bytes(out)
 
 
-def _compose_opaque(frame: Image.Image, background=(0, 0, 0)) -> Image.Image:
+def _compose_opaque(
+    frame: Image.Image, background: tuple[int, int, int] = (0, 0, 0)
+) -> Image.Image:
+    """Alpha-composite *frame* onto a solid *background* and return RGB."""
     rgba = frame.convert("RGBA")
     base = Image.new("RGBA", rgba.size, background + (255,))
     composed = Image.alpha_composite(base, rgba)
     return composed.convert("RGB")
 
 
-def _rotate_for_orientation(img: Image.Image, orientation_degrees: int) -> Image.Image:
-    if orientation_degrees not in (0, 90, 180, 270):
+def _rotate_for_orientation(
+    img: Image.Image, orientation_degrees: int
+) -> Image.Image:
+    """Rotate *img* to match *orientation_degrees* (0/90/180/270)."""
+    if orientation_degrees not in _VALID_ORIENTATIONS:
         raise ValueError("Invalid orientation")
     return img.rotate(-orientation_degrees, expand=False)
 
 
-def _load_font(font_path: Optional[Path], size: int):
+def _load_font(font_path: Optional[Path], size: int) -> ImageFont.FreeTypeFont:
+    """Return a PIL font at *size* pt, falling back through common system paths."""
     if font_path is not None:
         try:
             return ImageFont.truetype(str(font_path), size=size)
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             LOG.warning("Failed to load font '%s': %s", font_path, exc)
 
-    common_fonts = [
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    ]
-    for fp in common_fonts:
+    for fp in _COMMON_FONT_PATHS:
         try:
             return ImageFont.truetype(fp, size=size)
-        except Exception:
+        except Exception:  # pylint: disable=broad-except
             continue
 
     LOG.warning("No TTF font found; falling back to tiny default PIL font")
     return ImageFont.load_default()
 
 
+# ---------------------------------------------------------------------------
+# Timing helpers
+# ---------------------------------------------------------------------------
+
 def _ms_since(start: float) -> float:
+    """Return milliseconds elapsed since *start* (monotonic clock)."""
     return (time.monotonic() - start) * 1000.0
 
 
@@ -337,18 +416,21 @@ def _log_timing(
     warn_ms: float,
     extra: str = "",
 ) -> None:
+    """Log *elapsed_ms* at DEBUG level, or WARNING if it exceeds *warn_ms*."""
     if not enabled:
         return
-
     msg = f"{label}: {elapsed_ms:.1f} ms"
     if extra:
         msg += f" | {extra}"
-
     if elapsed_ms >= warn_ms:
         LOG.warning(msg)
     else:
         LOG.debug(msg)
 
+
+# ---------------------------------------------------------------------------
+# Animation preparation
+# ---------------------------------------------------------------------------
 
 def prepare_gif_animation(
     gif_path: Path,
@@ -356,15 +438,23 @@ def prepare_gif_animation(
     min_frame_ms: int = DEFAULT_MIN_FRAME_MS,
     dedupe: bool = True,
 ) -> PreparedAnimation:
+    """Load a GIF and return a :class:`PreparedAnimation` with RGB565 frames.
+
+    Frames shorter than *min_frame_ms* are extended to that minimum.  When
+    *dedupe* is True, consecutive identical frames are merged (their durations
+    are summed) to reduce GPU/USB traffic.
+    """
     img = Image.open(gif_path)
     frames: List[PreparedFrame] = []
     prev_bytes: Optional[bytes] = None
 
-    for frame in ImageSequence.Iterator(img):
-        duration_ms = int(frame.info.get("duration", img.info.get("duration", 100)) or 100)
+    for raw_frame in ImageSequence.Iterator(img):
+        duration_ms = int(
+            raw_frame.info.get("duration", img.info.get("duration", 100)) or 100
+        )
         duration_ms = max(duration_ms, min_frame_ms)
 
-        fr = _compose_opaque(frame)
+        fr = _compose_opaque(raw_frame)
         fr = fr.resize(LCD_SIZE, Image.Resampling.LANCZOS)
         fr = _rotate_for_orientation(fr, orientation_degrees)
         rgb565 = _rgb565_from_pil(fr)
@@ -382,6 +472,10 @@ def prepare_gif_animation(
     return PreparedAnimation(source=gif_path, frames=frames)
 
 
+# ---------------------------------------------------------------------------
+# Temperature card rendering
+# ---------------------------------------------------------------------------
+
 def build_temp_card_image(
     temp_c: float,
     orientation_degrees: int,
@@ -389,6 +483,7 @@ def build_temp_card_image(
     label_font_size: int = 24,
     font_path: Optional[Path] = None,
 ) -> Image.Image:
+    """Render a temperature readout card as a PIL Image."""
     canvas = Image.new("RGB", LCD_SIZE, (0, 0, 0))
     draw = ImageDraw.Draw(canvas)
 
@@ -433,6 +528,7 @@ def build_temp_card_rgb565(
     label_font_size: int = 24,
     font_path: Optional[Path] = None,
 ) -> bytes:
+    """Render a temperature card and return its RGB565 bytes directly."""
     return _rgb565_from_pil(
         build_temp_card_image(
             temp_c=temp_c,
@@ -444,16 +540,41 @@ def build_temp_card_rgb565(
     )
 
 
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
 def write_single_frame_gif(path: Path, image: Image.Image) -> None:
-    image.save(path, format="GIF", save_all=True, append_images=[], duration=100, loop=0, disposal=2)
+    """Write *image* as a one-frame looping GIF to *path*."""
+    image.save(
+        path,
+        format="GIF",
+        save_all=True,
+        append_images=[],
+        duration=100,
+        loop=0,
+        disposal=2,
+    )
 
 
-def parse_thresholds(items: Optional[Sequence[Sequence[str]]]) -> List[ThresholdRule]:
+def parse_thresholds(
+    items: Optional[Sequence[Sequence[str]]],
+) -> List[ThresholdRule]:
+    """Parse ``--threshold-gif`` CLI pairs into sorted :class:`ThresholdRule` objects.
+
+    Rules are sorted highest-threshold-first so the first match is always the
+    most specific.
+    """
     rules: List[ThresholdRule] = []
     if not items:
         return rules
     for threshold, path in items:
-        rules.append(ThresholdRule(threshold_c=float(threshold), gif_path=Path(path).expanduser().resolve()))
+        rules.append(
+            ThresholdRule(
+                threshold_c=float(threshold),
+                gif_path=Path(path).expanduser().resolve(),
+            )
+        )
     rules.sort(key=lambda r: r.threshold_c, reverse=True)
     return rules
 
@@ -463,6 +584,7 @@ def select_animation_path(
     default_gif: Path,
     threshold_rules: Sequence[ThresholdRule],
 ) -> Path:
+    """Return the GIF path appropriate for *temp_c*, or *default_gif*."""
     if temp_c is None:
         return default_gif
     for rule in threshold_rules:
@@ -472,9 +594,9 @@ def select_animation_path(
 
 
 def sleep_until(deadline: float, stopflag: ShutdownFlag) -> None:
+    """Sleep in short intervals until *deadline* or until a stop is requested."""
     while True:
-        now = time.monotonic()
-        remaining = deadline - now
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
         if stopflag.stop:
@@ -484,16 +606,16 @@ def sleep_until(deadline: float, stopflag: ShutdownFlag) -> None:
 
 def preload_animation_cache(
     animation_paths: Sequence[Path],
-    get_or_prepare_animation,
+    get_or_prepare_animation: Callable[[Path], PreparedAnimation],
 ) -> None:
+    """Pre-convert all unique GIFs in *animation_paths* and log summary stats."""
     unique_paths: List[Path] = []
     seen: set[Path] = set()
     for gif_path in animation_paths:
         resolved = gif_path.resolve()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        unique_paths.append(resolved)
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_paths.append(resolved)
 
     if not unique_paths:
         return
@@ -520,7 +642,12 @@ def preload_animation_cache(
     )
 
 
+# ---------------------------------------------------------------------------
+# Logging configuration
+# ---------------------------------------------------------------------------
+
 def configure_logging(verbose: bool, debug_timing: bool) -> None:
+    """Configure root and third-party log levels."""
     level = logging.DEBUG if (verbose or debug_timing) else logging.INFO
     logging.basicConfig(
         level=level,
@@ -528,8 +655,8 @@ def configure_logging(verbose: bool, debug_timing: bool) -> None:
         stream=sys.stdout,
     )
 
-    # Keep third-party chatter from crushing the terminal buffer.
-    noisy_loggers = [
+    # Suppress noisy third-party loggers that flood the terminal.
+    noisy_loggers = (
         "liquidctl",
         "liquidctl.driver",
         "usb",
@@ -537,13 +664,17 @@ def configure_logging(verbose: bool, debug_timing: bool) -> None:
         "usb.backend",
         "hid",
         "PIL",
-    ]
+    )
     for name in noisy_loggers:
-        if name != "liquidmotiond":
-            logging.getLogger(name).setLevel(logging.WARNING)
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
-def main() -> int:
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Construct and return the argument parser for liquidmotiond."""
     parser = argparse.ArgumentParser(description="Kraken 2023 fw2 GIF emulation daemon")
     parser.add_argument("default_gif", type=Path, help="Default GIF path")
     parser.add_argument(
@@ -557,7 +688,7 @@ def main() -> int:
         "--orientation",
         type=int,
         default=DEFAULT_ORIENTATION,
-        choices=(0, 90, 180, 270),
+        choices=_VALID_ORIENTATIONS,
         help=f"LCD orientation in degrees (default: {DEFAULT_ORIENTATION})",
     )
     parser.add_argument(
@@ -582,7 +713,10 @@ def main() -> int:
         "--show-temp-card-seconds",
         type=float,
         default=DEFAULT_STATUS_CARD_SECONDS,
-        help=f"Show a temp card this many seconds when polling temp (default: {DEFAULT_STATUS_CARD_SECONDS:.0f}, set 0 to disable)",
+        help=(
+            f"Show a temp card this many seconds when polling temp "
+            f"(default: {DEFAULT_STATUS_CARD_SECONDS:.0f}, set 0 to disable)"
+        ),
     )
     parser.add_argument(
         "--temp-font-size",
@@ -712,7 +846,16 @@ def main() -> int:
         reinit_on_error=DEFAULT_REINIT_ON_ERROR,
         preload_animations=True,
     )
-    args = parser.parse_args()
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    """Parse arguments, connect to the device, and run the animation loop."""
+    args = _build_arg_parser().parse_args()
 
     configure_logging(args.verbose, args.debug_timing)
 
@@ -740,7 +883,7 @@ def main() -> int:
         current_animation_path: Optional[Path] = None
         current_animation: Optional[PreparedAnimation] = None
 
-        last_temp_poll = 0.0
+        last_temp_poll = 0.0  # noqa: F841 – used by temp_worker via nonlocal
         frame_index = 0
         frame_counter = 0
 
@@ -760,21 +903,21 @@ def main() -> int:
                 session.upload_lcd_asset(prime_asset, preferred_mode=args.display_prime_mode)
 
             def get_or_prepare_animation(gif_path: Path) -> PreparedAnimation:
-                gif_path = gif_path.resolve()
-                cached = animation_cache.get(gif_path)
+                resolved = gif_path.resolve()
+                cached = animation_cache.get(resolved)
                 if cached is not None:
                     return cached
-                LOG.info("Preparing animation: %s", gif_path)
+                LOG.info("Preparing animation: %s", resolved)
                 prepared = prepare_gif_animation(
-                    gif_path=gif_path,
+                    gif_path=resolved,
                     orientation_degrees=args.orientation,
                     min_frame_ms=args.min_frame_ms,
                     dedupe=not args.no_dedupe,
                 )
-                animation_cache[gif_path] = prepared
+                animation_cache[resolved] = prepared
                 LOG.info(
                     "Prepared %s: %d frames (%.2fs loop, %.2f MiB cache)",
-                    gif_path.name,
+                    resolved.name,
                     len(prepared.frames),
                     prepared.total_duration_s,
                     prepared.total_frame_bytes / (1024.0 * 1024.0),
@@ -799,7 +942,9 @@ def main() -> int:
                 if args.brightness is not None:
                     session.set_brightness(int(args.brightness))
                 if args.display_prime_mode != "none":
-                    session.upload_lcd_asset(prime_asset, preferred_mode=args.display_prime_mode)
+                    session.upload_lcd_asset(
+                        prime_asset, preferred_mode=args.display_prime_mode
+                    )
 
             def temp_worker() -> None:
                 nonlocal current_animation_path, current_animation, frame_index, last_temp_poll
@@ -833,11 +978,15 @@ def main() -> int:
                                     LOG.info(
                                         "Switching animation due to temp %.1fC: %s -> %s",
                                         temp,
-                                        current_animation_path.name if current_animation_path else "?",
+                                        current_animation_path.name
+                                        if current_animation_path
+                                        else "?",
                                         desired_path.name,
                                     )
                                     current_animation_path = desired_path
-                                    current_animation = get_or_prepare_animation(desired_path)
+                                    current_animation = get_or_prepare_animation(
+                                        desired_path
+                                    )
                                     frame_index = 0
                                 if args.show_temp_card_seconds > 0:
                                     overlay_state.rgb565 = build_temp_card_rgb565(
@@ -847,27 +996,37 @@ def main() -> int:
                                         label_font_size=args.temp_label_font_size,
                                         font_path=font_path,
                                     )
-                                    overlay_state.active_until = time.monotonic() + args.show_temp_card_seconds
-                    except Exception as exc:
+                                    overlay_state.active_until = (
+                                        time.monotonic() + args.show_temp_card_seconds
+                                    )
+                    except Exception as exc:  # pylint: disable=broad-except
                         LOG.warning("Temperature handling failed: %s", exc)
                         if args.reinit_on_error:
                             try:
                                 session.reinitialize()
                                 restore_display_state()
-                            except Exception as rexc:
+                            except Exception as rexc:  # pylint: disable=broad-except
                                 LOG.warning("Reinit after temp error failed: %s", rexc)
                     last_temp_poll = time.monotonic()
                     next_poll = last_temp_poll + args.temp_poll_interval
 
-            temp_thread = threading.Thread(target=temp_worker, name="temp-worker", daemon=True)
+            temp_thread = threading.Thread(
+                target=temp_worker, name="temp-worker", daemon=True
+            )
             temp_thread.start()
 
+            # ----------------------------------------------------------------
+            # Main animation loop
+            # ----------------------------------------------------------------
             while not stopflag.stop:
                 now = time.monotonic()
 
                 with state_lock:
                     animation_snapshot = current_animation
-                    overlay_active = overlay_state.rgb565 is not None and overlay_state.active_until > now
+                    overlay_active = (
+                        overlay_state.rgb565 is not None
+                        and overlay_state.active_until > now
+                    )
                     overlay_rgb565 = overlay_state.rgb565 if overlay_active else None
 
                 if animation_snapshot is None or not animation_snapshot.frames:
@@ -877,23 +1036,29 @@ def main() -> int:
                 frame_counter += 1
                 frame_label = "temp_card" if overlay_rgb565 is not None else "frame_send"
                 payload = overlay_rgb565 if overlay_rgb565 is not None else frame.rgb565
-                duration_s = frame.duration_s if overlay_rgb565 is None else min(frame.duration_s, max(0.01, overlay_state.active_until - now))
+                if overlay_rgb565 is None:
+                    duration_s = frame.duration_s
+                else:
+                    duration_s = min(
+                        frame.duration_s,
+                        max(0.01, overlay_state.active_until - now),
+                    )
 
                 loop_start = time.monotonic()
-                send_start = time.monotonic()
+                send_start = loop_start
 
                 try:
                     if args.reinit_every_frame and overlay_rgb565 is None:
                         session.reinitialize()
                         restore_display_state()
                     session.send_rgb565_frame(payload)
-                except Exception as exc:
+                except Exception as exc:  # pylint: disable=broad-except
                     LOG.warning("Frame transfer failed: %s", exc)
                     if args.reinit_on_error:
                         try:
                             session.reinitialize()
                             restore_display_state()
-                        except Exception as rexc:
+                        except Exception as rexc:  # pylint: disable=broad-except
                             LOG.warning("Reinit after frame error failed: %s", rexc)
                     else:
                         sleep_until(time.monotonic() + 0.5, stopflag)
@@ -901,9 +1066,11 @@ def main() -> int:
                 send_done = time.monotonic()
                 send_ms = (send_done - send_start) * 1000.0
 
-                if args.debug_timing and (
-                    frame_counter % max(1, args.debug_frame_log_every) == 0
-                ):
+                log_this_frame = (
+                    args.debug_timing
+                    and frame_counter % max(1, args.debug_frame_log_every) == 0
+                )
+                if log_this_frame:
                     _log_timing(
                         True,
                         frame_label,
@@ -921,14 +1088,11 @@ def main() -> int:
                     frame_index = (frame_index + 1) % len(animation_snapshot.frames)
                 sleep_until(deadline, stopflag)
 
-                loop_ms = _ms_since(loop_start)
-                if args.debug_timing and (
-                    frame_counter % max(1, args.debug_frame_log_every) == 0
-                ):
+                if log_this_frame:
                     _log_timing(
                         True,
                         "frame_loop",
-                        loop_ms,
+                        _ms_since(loop_start),
                         args.debug_timing_warn_ms,
                         extra=f"frame={frame_counter}",
                     )
@@ -937,7 +1101,7 @@ def main() -> int:
             LOG.info("Stop requested")
         except KeyboardInterrupt:
             LOG.info("Interrupted")
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             LOG.exception("Fatal error: %s", exc)
             return 1
         finally:
