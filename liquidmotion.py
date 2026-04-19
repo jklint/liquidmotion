@@ -26,7 +26,7 @@ DEFAULT_ORIENTATION = 180
 DEFAULT_MIN_FRAME_MS = 33
 DEFAULT_TEMP_POLL_INTERVAL = 30.0
 DEFAULT_STATUS_CARD_SECONDS = 10.0
-DEFAULT_TEMP_FONT_SIZE = 100
+DEFAULT_TEMP_FONT_SIZE = 110
 DEFAULT_TEMP_LABEL_FONT_SIZE = 48
 DEFAULT_ALWAYS_DOUBLE_SEND = True
 DEFAULT_POST_SEND_SETTLE_MS = 20.0
@@ -491,7 +491,7 @@ def build_temp_card_image(
     font_label = _load_font(font_path, label_font_size)
 
     label = "Liquid"
-    value = f"{int(round(temp_c))} C"
+    value = f"{int(round(temp_c))}°"
 
     bbox_label = draw.textbbox((0, 0), label, font=font_label)
     bbox_value = draw.textbbox((0, 0), value, font=font_value)

@@ -1,0 +1,14 @@
+[Unit]
+Description=Kraken LCD GIF emulation (liquidmotion)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/scripts/liquidmotion
+EnvironmentFile=%h/.config/liquidmotion/liquidmotion.env
+ExecStart=/usr/bin/python3 %h/scripts/liquidmotion/liquidmotion.py ${LIQUIDMOTION_GIF} ${LIQUIDMOTION_ARGS}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
